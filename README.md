@@ -8,8 +8,9 @@ Hands-on lab to:
 4. Test GitOps behavior (auto-sync, self-heal, prune)
 5. Clean everything up to avoid AWS charges
 
-**Environment used:** EC2 instance (Amazon Linux 2023), region `us-east-1`, node type `t3.medium`, 2 worker nodes.
+**Environment used:** EC2 instance (Amazon Linux 2023), region `us-east-1`, node type `t3.medium`, 2 worker nodes, ArgoCD `v3.6.3`.
 **Git repo used:** `https://github.com/manojkumarsahoo-dev/argocd-test.git` (branch `main`, manifests in the `dev` folder)
+**App namespace:** `default` (the manifests do not set a namespace, so the app lands in `default`)
 
 ---
 
@@ -94,8 +95,9 @@ The CustomResourceDefinition "applicationsets.argoproj.io" is invalid:
 metadata.annotations: Too long: may not be more than 262144 bytes
 ```
 
-Cause: client-side apply stores the whole manifest in an annotation, and the ApplicationSet CRD is too big for it.
-Fix: use **`--server-side`** (already included above).
+- Cause: client-side apply stores the whole manifest in an annotation, and the ApplicationSet CRD is too big for it.
+- Effect: the `argocd-applicationset-controller` deployment stayed at `0/1` because its CRD was never created. The Application itself still worked, but the install was incomplete.
+- Fix: use **`--server-side`** (already included above).
 
 ### Step 7: Check the pods
 
@@ -114,6 +116,12 @@ argocd-notifications-controller-...
 argocd-redis-...
 argocd-repo-server-...
 argocd-server-...
+```
+
+You can also check deployments across all namespaces:
+
+```bash
+kubectl get deploy -A -o wide
 ```
 
 ### Step 8: Expose ArgoCD with a LoadBalancer
@@ -143,7 +151,16 @@ kubectl -n argocd get secret argocd-initial-admin-secret \
 
 ## Part 3: Prepare the Git repo
 
-Create this structure in your GitHub repo (`argocd-test`):
+### Step 10: Install git on the EC2 instance (optional, to edit the repo from the terminal)
+
+```bash
+yum install git -y
+git --version
+```
+
+You can also edit the files directly in the GitHub web UI instead.
+
+### Step 11: Create the repo structure
 
 ```
 argocd-test/
@@ -153,7 +170,7 @@ argocd-test/
     └── service.yaml
 ```
 
-### `dev/deployment.yaml`
+**`dev/deployment.yaml`**
 
 ```yaml
 apiVersion: apps/v1
@@ -179,7 +196,7 @@ spec:
             - containerPort: 80
 ```
 
-### `dev/service.yaml`
+**`dev/service.yaml`**
 
 ```yaml
 apiVersion: v1
@@ -195,7 +212,7 @@ spec:
       targetPort: 80
 ```
 
-Commit and push to the `main` branch.
+Commit and push to the `main` branch. (In the original run, replicas were later changed in Git to `1`, so the app ended at `1/1`.)
 
 ---
 
@@ -213,12 +230,12 @@ You can do this from the UI or from a YAML file. Both give the same result.
 | Application Name | `test` |
 | Project | `default` |
 | Sync Policy | `Automatic` (tick **Prune Resources** and **Self Heal**) |
-| Sync Options | **Auto-Create Namespace** (and optionally **Server-Side Apply**) |
+| Sync Options | **Server-Side Apply** (optional) |
 | Repository URL | `https://github.com/manojkumarsahoo-dev/argocd-test.git` |
 | Revision | `main` |
 | Path | `dev` |
 | Cluster URL | `https://kubernetes.default.svc` |
-| Namespace | `test` |
+| Namespace | `default` |
 
 3. Click **CREATE**
 
@@ -240,13 +257,12 @@ spec:
     path: dev
   destination:
     server: https://kubernetes.default.svc
-    namespace: test
+    namespace: default
   syncPolicy:
     automated:
       prune: true
       selfHeal: true
     syncOptions:
-      - CreateNamespace=true
       - ServerSideApply=true
 ```
 
@@ -262,29 +278,47 @@ kubectl apply -f application.yaml
 
 ```bash
 kubectl get applications -n argocd
-kubectl get all -n test
+kubectl get deploy
+kubectl get pods
+kubectl get svc
 ```
+
+(No `-n` needed because the app is in the `default` namespace.)
 
 Expected result in the ArgoCD UI (and CLI):
 
 - App status: **Synced** and **Healthy**
-- Resource tree: `test` → `svc swiggy-app`, `deploy swiggy-app` → `rs swiggy-app-xxxx` → **4 pods**, all `Running 1/1`
+- Resource tree: `test` → `svc swiggy-app`, `deploy swiggy-app` → `rs swiggy-app-xxxx` → pods, all `Running 1/1`
 
-If you made the Service type `LoadBalancer`, get its address and open it in the browser to see the nginx welcome page:
-
-```bash
-kubectl get svc swiggy-app -n test
-```
+If the Service type is `LoadBalancer`, open its `EXTERNAL-IP` in the browser to see the nginx welcome page.
 
 ---
 
 ## Part 6: Test GitOps behavior (practice)
 
-1. **Auto-sync:** change `replicas: 4` to `2` in `dev/deployment.yaml`, commit and push. ArgoCD detects the change and scales down (default polling is about 3 minutes, or click **Refresh**).
-2. **Self-heal:** run `kubectl scale deployment swiggy-app -n test --replicas=1`. ArgoCD reverts it back to the value in Git.
-3. **Pod recovery:** run `kubectl delete pod <pod-name> -n test`. The ReplicaSet creates a new one.
+### Self-heal test (done in the original lab)
+
+1. Check the current state: `kubectl get pods` (for example 1 pod).
+2. Change the live Deployment directly:
+
+   ```bash
+   kubectl edit deploy swiggy-app
+   ```
+
+   Change `replicas` (for example from 1 to 3) and save. You will see `deployment.apps/swiggy-app edited`.
+3. Run `kubectl get pods` straight away. Extra pods appear (3 pods, a few seconds old).
+4. Wait about 20 to 30 seconds and run `kubectl get pods` again. ArgoCD **self-heal** reverts the Deployment to the value in Git, and the extra pods go `Terminating` and disappear.
+5. Repeat it a couple of times to see the same result.
+
+> If you quit `kubectl edit` without saving, you get `Edit cancelled, no changes made.` This is normal.
+
+### Other tests
+
+1. **Auto-sync:** change `replicas` in `dev/deployment.yaml`, commit and push. ArgoCD applies it (polling is about 3 minutes, or click **Refresh**).
+2. **Self-heal off:** untick **Self Heal** in the app's sync policy, edit the Deployment with `kubectl edit`, and see the app turn **OutOfSync** instead of reverting.
+3. **Pod recovery:** `kubectl delete pod <pod-name>`. The ReplicaSet creates a new one.
 4. **Prune:** delete `service.yaml` from Git and push. ArgoCD removes the Service from the cluster.
-5. **Rollback:** in the UI open **HISTORY AND ROLLBACK** and roll back to an earlier revision. (Auto-sync must be disabled first for a manual rollback.)
+5. **Rollback:** in the UI open **HISTORY AND ROLLBACK** and roll back to an earlier revision (auto-sync must be disabled for this).
 
 ---
 
@@ -292,11 +326,13 @@ kubectl get svc swiggy-app -n test
 
 - [ ] `kubectl get nodes` shows 2 nodes `Ready`
 - [ ] `kubectl get pods -n argocd` shows all pods `Running`
+- [ ] `kubectl get deploy -A` shows `argocd-applicationset-controller` as `1/1` (not `0/1`)
 - [ ] `argocd-server` service has an ELB hostname as `EXTERNAL-IP`
-- [ ] ArgoCD login page opens and `admin` login works
+- [ ] ArgoCD login works with `admin` and the secret password
 - [ ] Application `test` shows **Synced** and **Healthy**
-- [ ] 4 `swiggy-app` pods are `Running 1/1` in namespace `test`
-- [ ] Changing the repo (push) triggers an automatic sync
+- [ ] `swiggy-app` pods are `Running 1/1` in the `default` namespace
+- [ ] A push to the repo triggers an automatic sync
+- [ ] A manual `kubectl edit` change is reverted by self-heal
 
 ---
 
@@ -331,12 +367,15 @@ Then confirm in the AWS Console that the CloudFormation stacks `eksctl-test-clus
 | `eksctl create cluster` fails | CloudFormation console, or `eksctl utils describe-stacks --region=us-east-1 --cluster=test` |
 | `kubectl` cannot connect | Re-run `aws eks update-kubeconfig --region us-east-1 --name test` |
 | CRD `Too long` error on ArgoCD install | Use `kubectl apply --server-side --force-conflicts` |
+| `argocd-applicationset-controller` stays `0/1` | Its CRD was not created. Re-run the install with `--server-side --force-conflicts` |
 | ArgoCD pods stuck in `Init` or `CreateContainerConfigError` | Wait 2 to 3 minutes, then `kubectl describe pod <name> -n argocd` |
+| `error: arguments in resource/name form must have a single resource and name` | Typo such as `kubectl get deploy/`. Use `kubectl get deploy` |
 | `EXTERNAL-IP` stays `<pending>` | Wait a few minutes. If still pending, check subnets and IAM permissions for ELB creation |
 | Browser cannot open the ELB URL | Use `https://`, accept the certificate warning, wait 2 to 3 minutes for DNS |
-| App shows `OutOfSync` | Click **Refresh**, then **Sync**. Check the **DIFF** button to see what differs |
-| App shows `Unknown` or repo error | Check the repo URL, branch and path (`dev`). Private repos need credentials added in ArgoCD Settings |
-| Pods stay `Pending` | `kubectl describe pod <name> -n test` (often not enough node capacity) |
+| App shows `OutOfSync` | Click **Refresh**, then **Sync**. Use **DIFF** to see what differs |
+| App shows `Unknown` or repo error | Check the repo URL, branch and path (`dev`). Private repos need credentials in ArgoCD Settings |
+| Pods stay `Pending` | `kubectl describe pod <name>` (often not enough node capacity) |
+| `kubectl get pods` shows nothing for the app | The app is in `default`. If you set another namespace, add `-n <namespace>` |
 | Lost the admin password | Run the Step 9 command again (works until the secret is deleted) |
 
 ---
@@ -344,11 +383,12 @@ Then confirm in the AWS Console that the CloudFormation stacks `eksctl-test-clus
 ## Useful commands
 
 ```bash
-kubectl get applications -n argocd          # list ArgoCD apps
-kubectl describe application test -n argocd # sync details and errors
-kubectl get all -n test                     # everything in the app namespace
+kubectl get applications -n argocd                 # list ArgoCD apps
+kubectl describe application test -n argocd        # sync details and errors
+kubectl get deploy -A -o wide                      # all deployments with images
+kubectl edit deploy swiggy-app                     # change live state (to test self-heal)
 kubectl logs -n argocd deploy/argocd-repo-server   # repo / manifest problems
-eksctl get cluster --region us-east-1       # list clusters
+eksctl get cluster --region us-east-1              # list clusters
 ```
 
 ---
@@ -358,5 +398,5 @@ eksctl get cluster --region us-east-1       # list clusters
 1. Redo the whole lab from scratch with a different cluster name and region.
 2. Install the ArgoCD CLI and log in with `argocd login`.
 3. Use `kubectl port-forward svc/argocd-server -n argocd 8080:443` instead of a LoadBalancer.
-4. Add a second app path (`prod`) and a second ArgoCD Application.
+4. Add a second app path (`prod`) and a second ArgoCD Application in another namespace.
 5. Replace the plain manifests with a Helm chart or Kustomize overlay.
